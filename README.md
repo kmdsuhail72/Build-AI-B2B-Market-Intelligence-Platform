@@ -4,7 +4,7 @@ A local-first pilot for source-backed business prospects, construction project s
 
 ## Architecture
 
-The application runs as a Docker Compose stack: a React dashboard calls a FastAPI backend, which stores application data in PostgreSQL. CSV imports and source-backed research use deterministic LangGraph workflows; an optional OpenAI-compatible provider is used only when AI answers are explicitly enabled.
+The application runs as a Docker Compose stack: a React dashboard calls a FastAPI backend, which stores application data in PostgreSQL. CSV imports and source-backed research use deterministic LangGraph workflows; an optional OpenAI-compatible provider is used only when AI answers or company enrichment are explicitly requested.
 
 <!-- mermaid-checked: no \n, no em-dash/en-dash, no {} in labels, subgraphs are id["label"], arrows are -->|"label"|, all subgraphs closed by end, ids unique -->
 ~~~mermaid
@@ -56,7 +56,7 @@ flowchart TD
 
 ### Data Storage and External Services
 
-PostgreSQL is the application's only persistent store; there is no cache, message broker, or separate graph database. The knowledge graph is derived from company, project, and relationship records. Research uses local lexical retrieval by default. If configured and explicitly requested, verified source excerpts and the query are sent to the configured OpenAI-compatible endpoint for answer generation. The MCP server is a separate stdio process that connects to the same database and exposes read-only tools.
+PostgreSQL is the application's only persistent store; there is no cache, message broker, or separate graph database. The knowledge graph is derived from company, project, and relationship records. Research uses local lexical retrieval and graph expansion by default. If configured and explicitly requested, verified source excerpts are sent to the configured OpenAI-compatible endpoint for cited answers or draft company enrichment. The MCP server is a separate stdio process that connects to the same database and exposes read-only tools.
 
 ### Key Architectural Decisions
 
@@ -130,12 +130,23 @@ Open the dashboard at <http://localhost:5173>. The API and interactive API docs 
 
 The first boot creates the administrator from `BOOTSTRAP_ADMIN_EMAIL` and `BOOTSTRAP_ADMIN_PASSWORD`. The API uses an HttpOnly, SameSite session cookie, Argon2id password hashes, and admin/sales/viewer roles. Admins can add team accounts from the dashboard. Set `COOKIE_SECURE=true` behind HTTPS. Change all sample `.env` secrets; do not expose this development deployment directly to the internet.
 
-The database starts empty. Import the reviewed CSV template in `data/prospects-template.csv` after adding source-backed records. The API accepts UTF-8 CSV files up to 5 MB. Required columns are `name`, `category`, `city`, `state`, and `source_url`; project and contact fields are optional. `estimated_units` and `estimated_doors` must be non-negative whole numbers; `doors_per_unit` must be between 0 and 100. A source must use an `http` or `https` URL. Import validates the complete file before committing it and matches companies by case-insensitive name + city.
+### Optional synthetic demo
+
+To populate a local instance with sample prospects, projects, contacts, a business relationship, and follow-up activities, run the seeder after the API is healthy:
+
+```powershell
+docker compose exec api python -m app.seed_demo
+```
+
+The command creates or updates the sales account `demo@vidya.local`, seeds three clearly labeled synthetic prospects, and prints a newly generated password. Save that password from the command output; it is not stored in the repository. Running the command again resets the demo account password. All demo records are marked as synthetic and unverified, and their source URLs and contact details use reserved example domains. They are for demonstration only and must not be treated as real business intelligence.
+
+The database starts empty unless you run the optional demo seeder. For real data, import the reviewed CSV template in `data/prospects-template.csv` after adding source-backed records. The API accepts UTF-8 CSV files up to 5 MB. Required columns are `name`, `category`, `city`, `state`, and `source_url`; project and contact fields are optional. `estimated_units` and `estimated_doors` must be non-negative whole numbers; `doors_per_unit` must be between 0 and 100. A source must use an `http` or `https` URL. Import validates the complete file before committing it and matches companies by case-insensitive name + city + state.
 
 ## Included in this pilot
 
 - PostgreSQL schema for companies, projects, source evidence, business relationships, and sales activities.
-- Prospect search, category/evidence filters, profile evidence links, and CSV export.
+- Normalized city/state locations and professionally scoped business contacts linked to companies, evidence, and project-specific activities.
+- Prospect search, category/evidence/city/state filters, profile source links, and enriched CSV export.
 - Reviewable CSV ingestion with basic validation and deduplication.
 - LangGraph-orchestrated CSV intake (`parse → validate/normalize → deduplicate → enrich/score → persist`) with stage reporting, atomic validation, and no autonomous web collection or LLM calls.
 - Role-gated admin, sales, and read-only viewer access, account provisioning, and revocable server-side sessions.
@@ -145,13 +156,23 @@ The database starts empty. Import the reviewed CSV template in `data/prospects-t
 - Editable relationship mapping with project associations.
 - Interactive knowledge graph that visualizes company-to-company relationships and company-to-project links, with filters, verification/lead-score indicators, and shortcuts to company profiles. The graph reuses PostgreSQL records; it does not require a separate graph database.
 - Project demand estimates with explicit-vs-derived distinction, formula, source/assumption notes, and confidence.
-- Lead scores with visible factors: category fit (10–30 points), any verified source (+20), and linked projects (+10 each, up to 30); total capped at 100. This is a prioritization aid, not a conversion prediction.
-- Sales activity capture with notes, next actions, optional follow-up dates, and completion tracking.
+- Lead scores with a visible 100-point breakdown: category fit (10–30), verified evidence (20–30), projects (up to 30), public website (5), and professional contact (5). Scores guide prioritization; they are not conversion predictions.
+- Sales activity capture for calls, emails, meetings, and notes, with structured outcomes, next actions, due dates, and completion tracking.
+- Dashboard-level next scheduled action and per-company recommendations that respect open follow-ups and recorded outcomes.
 - Research desk with local lexical retrieval over stored source excerpts and GraphRAG-style expansion through linked companies, relationships, and projects.
-- Optional citation-constrained AI answer generation; disabled unless configured and explicitly requested per research query.
+- Optional citation-constrained AI answers and evidence-quoted company enrichment; both are disabled unless configured and explicitly requested.
+- Company opportunity briefs with disclosed score components, evidence gaps, and actionable human-review steps.
 - Local stdio MCP server with read-only tools for company search, company profiles, project signals, relationship context, and source-backed research.
 
 The CSV workflow is a deterministic LangGraph state graph, not an AI agent: source-backed rows are parsed and fully validated before any records are staged; exact duplicate source/project rows are skipped; demand fields and a transparent score preview are derived; then database writes and the audit record commit together. Validation errors stop before persistence. No CSV data is sent to an LLM or external tracing service.
+
+## Database and data quality
+
+PostgreSQL stores companies, city/state reference locations, professional people, company-to-person links, projects, source evidence, relationships, and sales activities. A company is identified during import by its case-insensitive name, city, and state, so the same city name in different states remains distinct. Location reference rows use normalized state/city keys, and existing installations are backfilled to them by Alembic migration `0004`. Structured sales outcomes are added by migration `0005`.
+
+Contacts are limited to professional business names, roles, business email addresses, and business phone numbers. Company links retain a source record for provenance; imports keep contacts unverified until reviewed. Activities can optionally link to a contact and project, and the API checks those links belong to the selected company. Do not store sensitive personal details.
+
+CSV ingestion validates field lengths, URLs, numeric project estimates, demand confidence, contact details, and discovery dates before writing anything. Database constraints and indexes protect core entities and common city/state, project-status, source-verification, and follow-up queries. Each import, its duplicate counts, and its audit event commit atomically. The authenticated CSV export includes prospect scores and reasons, project signals, all original source references and verification dates, business relationships, professional contacts, sales activity/outcomes, and the next recommended action.
 
 ## Research desk: RAG and relationship graph
 
@@ -160,6 +181,12 @@ The authenticated Research desk searches stored source titles, excerpts, and lin
 To make records useful for research, include `source_content` in the reviewed CSV template. It is an optional excerpt field, limited to 20,000 characters per row. Only include publicly usable information that has been reviewed for the intended purpose. Records default to `unverified`; a human must explicitly set `verification_status` to `verified` before the text is eligible for hosted AI generation. Unverified excerpts may appear in local search results but are never included in a provider prompt.
 
 AI answer generation is off by default. To enable it, set `RAG_OPENAI_API_KEY` in `.env`, optionally set `RAG_OPENAI_MODEL` and `RAG_OPENAI_BASE_URL`, and restart the API. A user must also opt in for each query in the dashboard. Only excerpts marked `verified` are sent to the configured OpenAI-compatible endpoint; query text is sent with them. No source text is sent when generation is not requested. Treat provider terms, retention, and regional processing as part of your source/privacy review. Generated answers require citations to retrieved evidence; verify important claims against the original URLs.
+
+Company profiles include a deterministic opportunity brief and a separate, opt-in AI extraction action. Enrichment uses up to five verified excerpts (maximum 4,000 characters each); unverified text is excluded. The model must return an exact quoted span and source ID for every proposed claim. The API rejects claims whose quote does not match the submitted source text. Results are drafts only: they are audited but never written into company or project records automatically. A person must verify claims at the original source before updating records or contacting a prospect.
+
+Lead scores are deterministic and add to 100 possible points: business category relevance (up to 30), verified sources (20 for the first, then 5 per additional source up to 30), linked projects (10 each up to 30), a public website (5), and a linked professional business contact (5). Each company profile shows the component points, positive signals, evidence gaps, and recommended next actions. The score is a prioritization aid, not a probability of conversion. Revisit the weights against measured sales outcomes before treating them as predictive.
+
+The existing RAG and relationship-graph expansion are used because they expose source citations and connected companies/projects in a reviewable flow. An autonomous AI agent is intentionally not used: the current pilot has no approved write actions or measured outcome that would justify delegating decisions to one.
 
 ## MCP server
 
@@ -181,7 +208,57 @@ All tools are read-only and constrain result limits. `research_market` returns e
 
 ## Data collection and validation
 
-The MVP intentionally imports human-reviewed public records instead of crawling sites. Record only information suitable for business outreach, preserve the original source URL, and verify that the source and its terms permit the intended use. Keep discovery dates and source status current; the import date is recorded for each source. Do not treat AI-extracted or directory data as verified until a person checks it. Avoid collecting sensitive personal data.
+The application supports two compliant ingestion paths:
+
+- **Approved JSON APIs and feeds:** A Python collector fetches only endpoints explicitly listed in a local configuration whose access method and terms have been reviewed. It accepts HTTPS JSON only, disables redirects, rejects hosts that resolve to non-public IP addresses, and applies response and record limits. It does not crawl arbitrary pages or scrape Google Maps; an official API can be used when its terms allow it. Configure API credentials through environment variables referenced by name; never put tokens in the feed configuration or commit them.
+- **Human-reviewed sources:** For sources without a permitted machine-readable endpoint, use their approved export/download process and import reviewed records with the existing CSV workflow. This includes manual research from company websites and portfolios, RERA, government announcements, news, directories, or Google Maps where its terms allow the intended access and reuse.
+
+No feeds are preconfigured. To configure one, create a local JSON file (for example `data\approved-feeds.json`) using this schema. The example is illustrative only; replace the endpoint and terms URL with a source you have actually reviewed. Allowed `access_method` values are `official_api`, `public_json_feed`, and `licensed_api`. `fields` maps dotted JSON paths to the CSV columns; `defaults` can provide fixed geographic values when the feed omits them. `headers_env` maps optional HTTP headers to environment variable names for API credentials. The review date is an operator assertion, not an automated legal determination.
+
+```json
+{
+  "version": 1,
+  "sources": [
+    {
+      "id": "up-project-feed",
+      "name": "Reviewed UP project feed",
+      "access_method": "official_api",
+      "endpoint": "https://api.example.org/projects",
+      "terms_url": "https://api.example.org/terms",
+      "terms_reviewed_on": "2026-11-10",
+      "records_path": "data.projects",
+      "fields": {
+        "name": "developer.name",
+        "category": "developer.category",
+        "city": "location.city",
+        "state": "location.state",
+        "source_url": "public_url",
+        "project_name": "name",
+        "project_status": "status",
+        "estimated_units": "units"
+      },
+      "defaults": {
+        "state": "Uttar Pradesh"
+      },
+      "headers_env": {
+        "Authorization": "UP_PROJECT_FEED_TOKEN"
+      }
+    }
+  ]
+}
+```
+
+Run the collector from the `backend` directory. It writes a CSV for inspection; it does not persist records directly. Review the output and upload it using the admin CSV import in the dashboard.
+
+```powershell
+python -m app.workflows.approved_json_feeds `
+  --config ..\data\approved-feeds.json `
+  --output ..\data\collected-prospects.csv
+```
+
+The collector marks every record `unverified` and records its discovery date. The CSV import validates the complete file, deduplicates repeated observations, enriches project demand and score previews, then commits the records and audit entry together. Discovery dates are retained on source records and in CSV exports. A public announcement or portfolio can provide evidence of a project not found in RERA, but do not infer registration status from absence; preserve the evidence URL and verify claims independently.
+
+For every source, record only information suitable for the intended business purpose, preserve the original record URL, and confirm terms, applicable laws, privacy requirements, and access restrictions before collection or reuse. Do not bypass login, paywalls, rate limits, or other controls; do not treat AI-extracted or directory data as verified until a person checks it; and avoid sensitive personal data. Public availability alone does not grant permission to collect or reuse information.
 
 Project door estimates are never silently inferred. A project may store an explicit door estimate, or calculate one as `units × doors per unit`; the interface displays the method, assumptions, and confidence. Treat all estimates as hypotheses until specifications are confirmed.
 
@@ -211,6 +288,8 @@ npm install
 npm run build
 npm run dev
 ```
+
+GitHub Actions runs the backend suite against its SQLite test fixtures, verifies a fresh PostgreSQL 17 migration upgrade/downgrade/re-upgrade, and builds the frontend with Node.js 22 on pushes, pull requests, and manual dispatch.
 
 ## Pilot boundaries and next phase
 

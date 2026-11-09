@@ -1,4 +1,5 @@
 import { ChangeEvent, FormEvent, useEffect, useMemo, useState } from "react";
+import "./intelligence.css";
 
 type Company = {
   id: number;
@@ -40,6 +41,23 @@ type ResearchResult = {
   graph_neighbors: number;
   workflow: string[];
 };
+type EnrichmentClaim = {
+  claim_type: string;
+  text: string;
+  citation: string;
+  source_id: number;
+  quote: string;
+  source_title: string;
+  source_url: string;
+};
+type EnrichmentResult = {
+  company_id: number;
+  company_name: string;
+  claims: EnrichmentClaim[];
+  sources_used: { source_id: number; title: string; url: string }[];
+  persisted: false;
+  human_review_required: true;
+};
 type KnowledgeNode = {
   id: string;
   type: "company" | "project";
@@ -69,16 +87,29 @@ type KnowledgeGraphData = {
 
 type CompanyDetail = Company & {
   description: string | null;
-  sources: { id: number; url: string; title: string | null; source_type: string; verification_status: string; discovered_at: string }[];
+  sources: { id: number; url: string; title: string | null; source_type: string; verification_status: string; discovered_at: string; has_content: boolean }[];
+  opportunity_report: {
+    score: number;
+    priority: "low" | "medium" | "high";
+    score_components: { key: string; label: string; points: number; maximum: number }[];
+    positive_signals: string[];
+    evidence_gaps: string[];
+    recommended_actions: string[];
+    next_sales_action: { action: string; reason: string; due_date: string | null; activity_id: number | null; status: "scheduled" | "recommended" | "paused" };
+    latest_sales_outcome: string | null;
+    evidence_summary: { verified_sources: number; unverified_sources: number; rejected_sources: number; projects: number; professional_contacts: number };
+    human_review_required: boolean;
+  };
   projects: { id: number; name: string; location: string | null; status: string; estimated_units: number | null; estimated_doors: number | null; explicit_estimated_doors: number | null; doors_per_unit: number | null; estimate_method: string; estimate_basis: string | null; demand_confidence: string; demand_notes: string | null }[];
   relationships: { id: number; related_company_id: number; related_company_name: string; relationship_type: string; project_name: string | null; notes: string | null }[];
-  activities: { id: number; activity_type: string; notes: string; next_action: string | null; due_date: string | null; completed_at: string | null; created_at: string }[];
+  activities: { id: number; activity_type: string; notes: string; next_action: string | null; sales_outcome: string | null; due_date: string | null; completed_at: string | null; created_at: string }[];
 };
 
-type Summary = { companies: number; projects: number; verified_sources: number; open_follow_ups: number };
-type ActivityForm = { activity_type: string; notes: string; next_action: string; due_date: string };
+type DashboardNextAction = { activity_id: number; company_id: number; company_name: string; action: string; due_date: string | null } | null;
+type Summary = { companies: number; projects: number; verified_sources: number; open_follow_ups: number; next_action: DashboardNextAction };
+type ActivityForm = { activity_type: string; notes: string; next_action: string; sales_outcome: string; due_date: string };
 
-const emptySummary: Summary = { companies: 0, projects: 0, verified_sources: 0, open_follow_ups: 0 };
+const emptySummary: Summary = { companies: 0, projects: 0, verified_sources: 0, open_follow_ups: 0, next_action: null };
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, { credentials: "same-origin", ...options });
@@ -104,6 +135,7 @@ function App() {
   const [category, setCategory] = useState("");
   const [verification, setVerification] = useState("");
   const [city, setCity] = useState("");
+  const [state, setState] = useState("");
   const [hasProject, setHasProject] = useState("");
   const [offset, setOffset] = useState(0);
   const [total, setTotal] = useState(0);
@@ -122,6 +154,9 @@ function App() {
   const [researchBusy, setResearchBusy] = useState(false);
   const [researchError, setResearchError] = useState("");
   const [useAiAnswer, setUseAiAnswer] = useState(false);
+  const [aiEnrichment, setAiEnrichment] = useState<EnrichmentResult | null>(null);
+  const [aiEnrichmentBusy, setAiEnrichmentBusy] = useState(false);
+  const [aiEnrichmentError, setAiEnrichmentError] = useState("");
   const [includeGraph, setIncludeGraph] = useState(true);
   const [knowledgeGraph, setKnowledgeGraph] = useState<KnowledgeGraphData | null>(null);
   const [graphQuery, setGraphQuery] = useState("");
@@ -129,7 +164,7 @@ function App() {
   const [graphError, setGraphError] = useState("");
   const [graphBusy, setGraphBusy] = useState(false);
   const [graphSelection, setGraphSelection] = useState<KnowledgeNode | null>(null);
-  const [activity, setActivity] = useState<ActivityForm>({ activity_type: "call", notes: "", next_action: "", due_date: "" });
+  const [activity, setActivity] = useState<ActivityForm>({ activity_type: "call", notes: "", next_action: "", sales_outcome: "", due_date: "" });
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -163,6 +198,7 @@ function App() {
       if (category) params.set("category", category);
       if (verification) params.set("verification", verification);
       if (city.trim()) params.set("city", city.trim());
+      if (state.trim()) params.set("state", state.trim());
       if (hasProject) params.set("has_project", hasProject);
       params.set("limit", String(pageSize));
       params.set("offset", String(offset));
@@ -214,11 +250,11 @@ function App() {
     if (!user) return;
     const timer = window.setTimeout(() => void loadCompanies(), 200);
     return () => window.clearTimeout(timer);
-  }, [query, category, verification, city, hasProject, offset, user]);
+  }, [query, category, verification, city, state, hasProject, offset, user]);
 
   useEffect(() => {
     setOffset(0);
-  }, [query, category, verification, city, hasProject]);
+  }, [query, category, verification, city, state, hasProject]);
 
   useEffect(() => {
     if (selectedId !== null) void loadDetail(selectedId);
@@ -236,7 +272,7 @@ function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ...activity, due_date: activity.due_date || null, next_action: activity.next_action || null }),
       });
-      setActivity({ activity_type: "call", notes: "", next_action: "", due_date: "" });
+      setActivity({ activity_type: "call", notes: "", next_action: "", sales_outcome: "", due_date: "" });
       setNotice("Follow-up saved.");
       await loadDetail(detail.id);
       await loadCompanies();
@@ -308,6 +344,7 @@ function App() {
     setQuery(String(filters.q || ""));
     setCategory(String(filters.category || ""));
     setCity(String(filters.city || ""));
+    setState(String(filters.state || ""));
     setVerification(String(filters.verification || ""));
     setHasProject(filters.has_project === true ? "true" : filters.has_project === false ? "false" : "");
     setOffset(0);
@@ -319,6 +356,7 @@ function App() {
       q: query.trim() || null,
       category: category || null,
       city: city.trim() || null,
+      state: state.trim() || null,
       verification: verification || null,
       has_project: hasProject ? hasProject === "true" : null,
     };
@@ -393,6 +431,20 @@ function App() {
     }
   }
 
+  async function enrichCompany(companyId: number) {
+    setAiEnrichmentBusy(true);
+    setAiEnrichmentError("");
+    try {
+      setAiEnrichment(await request<EnrichmentResult>(`/api/companies/${companyId}/ai-enrichment`, {
+        method: "POST",
+      }));
+    } catch (reason) {
+      setAiEnrichmentError(reason instanceof Error ? reason.message : "AI enrichment failed.");
+    } finally {
+      setAiEnrichmentBusy(false);
+    }
+  }
+
   if (authLoading) return <div className="auth-page"><div className="auth-card">Checking your session…</div></div>;
   if (!user) return <LoginPage onSubmit={signIn} busy={authBusy} error={authError} />;
 
@@ -424,6 +476,12 @@ function App() {
           <Metric label="PROJECT SIGNALS" value={summary.projects} icon="⌂" trend="Linked to prospects" />
           <Metric label="VERIFIED SOURCES" value={summary.verified_sources} icon="↗" trend="Evidence checked" />
           <Metric label="OPEN NEXT ACTIONS" value={summary.open_follow_ups} icon="◷" trend="Sales follow-ups to close" />
+        </section>
+        <section className="dashboard-next-action" aria-label="Next recommended sales action">
+          <div><div className="eyebrow">SALES PRIORITY</div><strong>{summary.next_action?.action || "Review a prospect profile for its recommended next step."}</strong>
+            <small>{summary.next_action ? `${summary.next_action.company_name}${summary.next_action.due_date ? ` · due ${summary.next_action.due_date}` : ""}` : "No open scheduled follow-ups"}</small>
+          </div>
+          {summary.next_action && <button className="button secondary" onClick={() => { setSelectedId(summary.next_action?.company_id ?? null); document.getElementById("prospects")?.scrollIntoView({ behavior: "smooth" }); }}>Open prospect →</button>}
         </section>
 
         <section className="knowledge-graph-section" id="knowledge-graph">
@@ -464,6 +522,7 @@ function App() {
                 <select value={category} onChange={(event) => setCategory(event.target.value)} aria-label="Filter by category"><option value="">All categories</option>{categories.map((item) => <option key={item}>{item}</option>)}</select>
                 <select value={verification} onChange={(event) => setVerification(event.target.value)} aria-label="Filter by source status"><option value="">All evidence</option><option value="verified">Verified sources</option><option value="unverified">Needs verification</option></select>
                 <input className="city-filter" value={city} onChange={(event) => setCity(event.target.value)} placeholder="City" aria-label="Filter by city" />
+                <input className="city-filter" value={state} onChange={(event) => setState(event.target.value)} placeholder="State" aria-label="Filter by state" />
                 <select value={hasProject} onChange={(event) => setHasProject(event.target.value)} aria-label="Filter by project"><option value="">Any project status</option><option value="true">Has linked project</option><option value="false">No linked project</option></select>
                 <div className="saved-search-controls"><select aria-label="Saved searches" value={selectedSearchId} onChange={(event) => { setSelectedSearchId(event.target.value); const selected = savedSearches.find((item) => item.id === Number(event.target.value)); if (selected) applyFilters(selected.filters); }}><option value="">Saved searches</option>{savedSearches.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select>{selectedSearchId && <button className="text-button" onClick={deleteSavedSearch}>Delete</button>}<input aria-label="New saved search name" placeholder="Save current filters as…" value={saveSearchName} onChange={(event) => setSaveSearchName(event.target.value)} /><button className="button secondary" onClick={saveSearch} disabled={!saveSearchName.trim()}>Save view</button></div>
               </div>
@@ -479,7 +538,7 @@ function App() {
               <div className="table-footer">Showing <strong>{total === 0 ? 0 : offset + 1}–{Math.min(offset + companies.length, total)}</strong> of {total} prospects <button className="text-button" disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - pageSize))}>Previous</button><button className="text-button" disabled={offset + pageSize >= total} onClick={() => setOffset(offset + pageSize)}>Next</button><span>Scores are evidence-based guidance, not predictions.</span></div>
             </div>
             <aside className="detail-panel">
-              {detail ? <CompanyProfile company={detail} companies={companies} activity={activity} setActivity={setActivity} saveActivity={saveActivity} refresh={async () => { await loadDetail(detail.id); await loadCompanies(); await loadKnowledgeGraph(); }} canWrite={user.role !== "viewer"} busy={busy} /> :
+              {detail ? <CompanyProfile company={detail} companies={companies} activity={activity} setActivity={setActivity} saveActivity={saveActivity} refresh={async () => { await loadDetail(detail.id); await loadCompanies(); await loadKnowledgeGraph(); }} canWrite={user.role !== "viewer"} busy={busy} aiAvailable={researchStatus?.generation_available ?? false} enrichment={aiEnrichment?.company_id === detail.id ? aiEnrichment : null} enrichmentBusy={aiEnrichmentBusy} enrichmentError={aiEnrichmentError} onEnrich={() => void enrichCompany(detail.id)} /> :
                 <div className="profile-empty"><div className="empty-orbit">◎</div><h3>Select a prospect</h3><p>Review its source evidence, project signals, relationships, and recommended next step.</p><div className="empty-hint">TIP <span>Verified sources improve confidence—not commercial fit.</span></div></div>}
             </aside>
           </div>
@@ -717,7 +776,7 @@ function Score({ score }: { score: number }) {
   return <div className={`score ${tone}`}><div className="score-track"><i style={{ width: `${score}%` }} /></div><strong>{score}</strong></div>;
 }
 
-function CompanyProfile({ company, companies, activity, setActivity, saveActivity, refresh, canWrite, busy }: {
+function CompanyProfile({ company, companies, activity, setActivity, saveActivity, refresh, canWrite, busy, aiAvailable, enrichment, enrichmentBusy, enrichmentError, onEnrich }: {
   company: CompanyDetail;
   companies: Company[];
   activity: ActivityForm;
@@ -726,6 +785,11 @@ function CompanyProfile({ company, companies, activity, setActivity, saveActivit
   refresh: () => void;
   canWrite: boolean;
   busy: boolean;
+  aiAvailable: boolean;
+  enrichment: EnrichmentResult | null;
+  enrichmentBusy: boolean;
+  enrichmentError: string;
+  onEnrich: () => void;
 }) {
   const [relatedCompanyId, setRelatedCompanyId] = useState("");
   const [relationshipType, setRelationshipType] = useState("works with");
@@ -784,7 +848,40 @@ function CompanyProfile({ company, companies, activity, setActivity, saveActivit
   return <div className="profile-content">
     <div className="profile-heading"><div className="company-icon large">{company.name.slice(0, 1).toUpperCase()}</div><div><div className="eyebrow">PROSPECT PROFILE</div><h3>{company.name}</h3><span>{company.category} · {company.city}</span></div></div>
     {company.description && <p className="description">{company.description}</p>}
-    <div className="score-explanation"><div className="score-line"><span>LEAD SCORE</span><Score score={company.score} /></div><ul>{company.score_reasons.map((reason) => <li key={reason}>{reason}</li>)}</ul></div>
+    <div className="score-explanation"><div className="score-line"><span>LEAD SCORE</span><Score score={company.score} /></div><ul>{company.score_reasons.map((reason) => <li key={reason}>{reason}</li>)}</ul>
+      <div className="score-breakdown">{company.opportunity_report.score_components.map((component) => <div key={component.key}><span>{component.label}</span><strong>{component.points}/{component.maximum}</strong></div>)}</div>
+    </div>
+    <div className="opportunity-report">
+      <div className="opportunity-heading"><strong>Opportunity brief</strong><span className={`priority ${company.opportunity_report.priority}`}>{company.opportunity_report.priority} priority</span></div>
+      <small>{company.opportunity_report.evidence_summary.verified_sources} verified · {company.opportunity_report.evidence_summary.unverified_sources} unverified · {company.opportunity_report.evidence_summary.rejected_sources} rejected · {company.opportunity_report.evidence_summary.projects} projects · {company.opportunity_report.evidence_summary.professional_contacts} business contacts</small>
+      <div className={`next-sales-action ${company.opportunity_report.next_sales_action.status}`}>
+        <b>Next recommended sales action</b>
+        <p>{company.opportunity_report.next_sales_action.action}</p>
+        <small>{company.opportunity_report.next_sales_action.reason}{company.opportunity_report.next_sales_action.due_date ? ` Due ${company.opportunity_report.next_sales_action.due_date}.` : ""}</small>
+      </div>
+      {company.opportunity_report.positive_signals.length > 0 && <div><b>Signals</b><ul>{company.opportunity_report.positive_signals.map((signal) => <li key={signal}>{signal}</li>)}</ul></div>}
+      {company.opportunity_report.evidence_gaps.length > 0 && <div><b>Evidence gaps</b><ul>{company.opportunity_report.evidence_gaps.map((gap) => <li key={gap}>{gap}</li>)}</ul></div>}
+      <div><b>Recommended next steps</b><ul>{company.opportunity_report.recommended_actions.map((action) => <li key={action}>{action}</li>)}</ul></div>
+      <small className="privacy-note">Evidence-based guidance, not a prediction. Human review is required before acting.</small>
+    </div>
+    <div className="ai-enrichment">
+      <div className="opportunity-heading"><strong>AI-assisted source review</strong><span className="research-mode">OPT-IN</span></div>
+      <p className="privacy-note">Only verified source excerpts are sent to the configured AI provider. Suggested claims remain drafts and are never saved automatically.</p>
+      <button className="button secondary" onClick={onEnrich} disabled={!aiAvailable || enrichmentBusy || !company.sources.some((source) => source.verification_status === "verified" && source.has_content)}>
+        {enrichmentBusy ? "Reviewing verified sources…" : "Extract evidence-backed signals"}
+      </button>
+      {!aiAvailable && <small className="muted">Configure the AI provider to enable enrichment.</small>}
+      {!company.sources.some((source) => source.verification_status === "verified" && source.has_content) && <small className="muted">Add a source excerpt and verify it before AI extraction.</small>}
+      {enrichmentError && <div className="notice error" role="alert">{enrichmentError}</div>}
+      {enrichment && <div className="enrichment-claims">
+        {!enrichment.claims.length && <p className="muted small-text">No structured claims were supported by the selected excerpts.</p>}
+        {enrichment.claims.map((claim, index) => <article className="enrichment-claim" key={`${claim.source_id}-${index}`}>
+          <strong>{claim.claim_type.replaceAll("_", " ")}</strong><p>{claim.text}</p>
+          <blockquote>{claim.quote}</blockquote>
+          <a href={claim.source_url} target="_blank" rel="noreferrer">[{claim.citation}] {claim.source_title} ↗</a>
+        </article>)}
+      </div>}
+    </div>
     <SectionTitle title="Source evidence" count={company.sources.length} />
     {company.sources.length ? <div className="profile-list">{company.sources.map((source) => <a className="source-row" key={source.id} href={source.url} target="_blank" rel="noreferrer"><span className="source-icon">↗</span><span><strong>{source.title || source.source_type}</strong><small>{source.verification_status} · discovered {source.discovered_at}</small></span><b>↗</b></a>)}</div> : <p className="muted small-text">No source records. Import evidence before acting on this lead.</p>}
     <SectionTitle title="Project signals" count={company.projects.length} />
@@ -804,10 +901,17 @@ function CompanyProfile({ company, companies, activity, setActivity, saveActivit
       <div className="form-row"><select value={activity.activity_type} onChange={(event) => setActivity({ ...activity, activity_type: event.target.value })}><option value="call">Call</option><option value="email">Email</option><option value="meeting">Meeting</option><option value="note">Note</option></select><input type="date" value={activity.due_date} onChange={(event) => setActivity({ ...activity, due_date: event.target.value })} aria-label="Follow-up due date" /></div>
       <textarea required placeholder="Add a note about this interaction..." value={activity.notes} onChange={(event) => setActivity({ ...activity, notes: event.target.value })} />
       <input placeholder="Next recommended action (optional)" value={activity.next_action} onChange={(event) => setActivity({ ...activity, next_action: event.target.value })} />
+      <select aria-label="Sales outcome" value={activity.sales_outcome} onChange={(event) => setActivity({ ...activity, sales_outcome: event.target.value })}>
+        <option value="">Record sales outcome (optional)</option>
+        <option value="contacted">Contacted</option><option value="interested">Interested</option>
+        <option value="qualified">Qualified</option><option value="proposal_sent">Proposal sent</option>
+        <option value="won">Won</option><option value="lost">Lost</option>
+        <option value="not_interested">Not interested</option><option value="no_response">No response</option>
+      </select>
       <button className="button primary full" disabled={busy}>Save sales activity</button>
     </form>}
     {activityMessage && <p className="muted small-text">{activityMessage}</p>}
-    {company.activities.map((item) => <div className={`activity-item ${item.completed_at ? "completed" : ""}`} key={item.id}><div><strong>{item.activity_type}</strong><time>{new Date(item.created_at).toLocaleDateString("en-IN")}{item.due_date ? ` · due ${item.due_date}` : ""}</time></div><p>{item.notes}</p>{item.next_action && <div className="next-action"><small>{item.completed_at ? "Completed: " : "Next: "}{item.next_action}</small>{canWrite && !item.completed_at && <button onClick={() => void completeFollowUp(item.id)}>Mark done</button>}</div>}</div>)}
+    {company.activities.map((item) => <div className={`activity-item ${item.completed_at ? "completed" : ""}`} key={item.id}><div><strong>{item.activity_type}{item.sales_outcome && <span className="sales-outcome"> · {item.sales_outcome.replaceAll("_", " ")}</span>}</strong><time>{new Date(item.created_at).toLocaleDateString("en-IN")}{item.due_date ? ` · due ${item.due_date}` : ""}</time></div><p>{item.notes}</p>{item.next_action && <div className="next-action"><small>{item.completed_at ? "Completed: " : "Next: "}{item.next_action}</small>{canWrite && !item.completed_at && <button onClick={() => void completeFollowUp(item.id)}>Mark done</button>}</div>}</div>)}
   </div>;
 }
 

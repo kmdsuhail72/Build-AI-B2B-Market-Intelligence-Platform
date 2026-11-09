@@ -101,10 +101,15 @@ def test_import_profile_activity_relationship_and_export(client):
             "notes": "Discussed project materials",
             "next_action": "Send product catalogue",
             "due_date": "2026-11-20",
+            "sales_outcome": "interested",
         },
     )
     assert activity.status_code == 201
     assert client.get("/api/dashboard/summary").json()["open_follow_ups"] == 1
+    next_action = client.get("/api/dashboard/summary").json()["next_action"]
+    assert next_action["company_id"] == architect["id"]
+    assert next_action["action"] == "Send product catalogue"
+    assert client.get(f"/api/companies/{architect['id']}").json()["opportunity_report"]["next_sales_action"]["status"] == "scheduled"
     assert client.post(f"/api/activities/{activity.json()['id']}/complete").status_code == 200
     assert client.get("/api/dashboard/summary").json()["open_follow_ups"] == 0
     assert client.post(
@@ -118,12 +123,52 @@ def test_import_profile_activity_relationship_and_export(client):
 
     profile = client.get(f"/api/companies/{architect['id']}").json()
     assert profile["activities"][0]["next_action"] == "Send product catalogue"
+    assert profile["activities"][0]["sales_outcome"] == "interested"
     assert profile["activities"][0]["completed_at"] is not None
+    assert profile["opportunity_report"]["latest_sales_outcome"] == "interested"
+    assert profile["opportunity_report"]["next_sales_action"]["action"].startswith(
+        "Identify and verify"
+    )
     assert profile["relationships"][0]["related_company_name"] == "Sarnath Build Co"
     exported = client.get("/api/export.csv")
     assert exported.status_code == 200
     assert exported.headers["content-type"].startswith("text/csv")
     assert "Kashi Design Studio" in exported.text
+    exported_row = next(
+        row for row in csv.DictReader(io.StringIO(exported.text))
+        if row["name"] == "Kashi Design Studio"
+    )
+    assert "Riverfront Residences" in exported_row["projects"]
+    assert "https://example.com/kashi" in exported_row["source_references"]
+    assert "interested" in exported_row["sales_activity"]
+    assert exported_row["next_recommended_action"]
+
+
+def test_activity_rejects_unknown_sales_outcome(client):
+    imported = client.post(
+        "/api/import/csv",
+        files={
+            "file": (
+                "prospect.csv",
+                b"name,category,city,state,source_url\n"
+                b"Kashi Homes,Builder,Varanasi,Uttar Pradesh,https://example.com/kashi\n",
+                "text/csv",
+            )
+        },
+    )
+    assert imported.status_code == 200
+    company = client.get("/api/companies").json()[0]
+
+    response = client.post(
+        f"/api/companies/{company['id']}/activities",
+        json={
+            "activity_type": "call",
+            "notes": "Spoke to the business contact",
+            "sales_outcome": "maybe",
+        },
+    )
+
+    assert response.status_code == 422
 
 
 def test_import_is_atomic_when_a_row_is_invalid(client):
@@ -155,6 +200,127 @@ def test_csv_export_uses_standard_csv_escaping(client):
     rows = list(csv.DictReader(io.StringIO(client.get("/api/export.csv").text)))
     assert rows[0]["name"] == "'=1+1"
     assert rows[1]["name"] == "Studio, North"
+
+
+def test_import_preserves_discovery_date_and_rejects_invalid_dates(client):
+    csv_content = (
+        "name,category,city,state,source_url,discovered_at\n"
+        "Kashi Homes,Builder,Varanasi,Uttar Pradesh,"
+        "https://example.com/kashi,2025-03-04\n"
+    )
+    imported = client.post(
+        "/api/import/csv",
+        files={"file": ("dated.csv", csv_content.encode(), "text/csv")},
+    )
+    assert imported.status_code == 200
+    company = client.get("/api/companies").json()[0]
+    profile = client.get(f"/api/companies/{company['id']}").json()
+    assert profile["sources"][0]["discovered_at"] == "2025-03-04"
+
+    exported = list(csv.DictReader(io.StringIO(client.get("/api/export.csv").text)))
+    assert exported[0]["discovered_at"] == "2025-03-04"
+    assert exported[0]["source_type"] == "website"
+
+    invalid = client.post(
+        "/api/import/csv",
+        files={
+            "file": (
+                "invalid-date.csv",
+                (
+                    "name,category,city,state,source_url,discovered_at\n"
+                    "Bad Date,Builder,Varanasi,Uttar Pradesh,"
+                    "https://example.com/bad,not-a-date\n"
+                ).encode(),
+                "text/csv",
+            )
+        },
+    )
+    assert invalid.status_code == 422
+    assert len(client.get("/api/companies").json()) == 1
+
+
+def test_people_locations_and_activities_are_linked_and_multi_state_safe(client):
+    csv_content = (
+        "name,category,city,state,source_url,project_name,contact_name,contact_role,"
+        "contact_email,contact_phone\n"
+        "Kashi Homes,Builder,Springfield,Uttar Pradesh,https://example.com/up,"
+        "River Homes,Asha Sharma,Sales Director,asha@example.com,+91-555-0101\n"
+        "Kashi Homes,Builder,Springfield,Bihar,https://example.com/bihar,"
+        ",Asha Sharma,Sales Director,ASHA@example.com,+91-555-0101\n"
+    )
+    imported = client.post(
+        "/api/import/csv",
+        files={"file": ("contacts.csv", csv_content.encode(), "text/csv")},
+    )
+    assert imported.status_code == 200
+    companies = client.get("/api/companies").json()
+    assert len(companies) == 2
+    up_company = next(item for item in companies if item["state"] == "Uttar Pradesh")
+    bihar_company = next(item for item in companies if item["state"] == "Bihar")
+    assert client.get("/api/companies?city=Springfield&state=Bihar").json() == [
+        bihar_company
+    ]
+    assert client.get("/api/knowledge-graph?city=Springfield&state=Bihar").json()[
+        "total_companies"
+    ] == 1
+
+    profile = client.get(f"/api/companies/{up_company['id']}").json()
+    assert profile["contacts"] == [
+        {
+            "id": profile["contacts"][0]["id"],
+            "name": "Asha Sharma",
+            "business_email": "asha@example.com",
+            "business_phone": "+91-555-0101",
+            "job_title": "Sales Director",
+            "source_url": "https://example.com/up",
+            "verification_status": "unverified",
+            "discovered_at": profile["sources"][0]["discovered_at"],
+        }
+    ]
+    assert client.get(f"/api/companies/{bihar_company['id']}").json()["contacts"][0]["id"] == profile[
+        "contacts"
+    ][0]["id"]
+
+    project = profile["projects"][0]
+    activity = client.post(
+        f"/api/companies/{up_company['id']}/activities",
+        json={
+            "activity_type": "meeting",
+            "notes": "Discussed project materials",
+            "person_id": profile["contacts"][0]["id"],
+            "project_id": project["id"],
+        },
+    )
+    assert activity.status_code == 201
+    updated_profile = client.get(f"/api/companies/{up_company['id']}").json()
+    assert updated_profile["activities"][0]["person_name"] == "Asha Sharma"
+    assert updated_profile["activities"][0]["project_name"] == "River Homes"
+
+    invalid_activity = client.post(
+        f"/api/companies/{bihar_company['id']}/activities",
+        json={
+            "activity_type": "meeting",
+            "notes": "Cross-company contact reference",
+            "project_id": project["id"],
+        },
+    )
+    assert invalid_activity.status_code == 422
+
+
+def test_contact_validation_keeps_import_atomic(client):
+    csv_content = (
+        "name,category,city,state,source_url,contact_name,contact_email\n"
+        "Good Studio,Architect,Varanasi,Uttar Pradesh,https://example.com/good,"
+        "Sana Khan,sana@example.com\n"
+        "Bad Studio,Architect,Varanasi,Uttar Pradesh,https://example.com/bad,"
+        ",not-an-email\n"
+    )
+    response = client.post(
+        "/api/import/csv",
+        files={"file": ("contacts.csv", csv_content.encode(), "text/csv")},
+    )
+    assert response.status_code == 422
+    assert client.get("/api/companies").json() == []
 
 
 def test_login_role_guards_audit_and_logout(client):
@@ -410,7 +576,7 @@ def test_ai_answer_sends_only_verified_excerpts_and_requires_citations(client, m
         def __exit__(self, *_):
             return None
 
-        def read(self):
+        def read(self, _size=-1):
             return json.dumps(
                 {"choices": [{"message": {"content": "Construction starts in April [S1]."}}]}
             ).encode()
@@ -431,3 +597,164 @@ def test_ai_answer_sends_only_verified_excerpts_and_requires_citations(client, m
     assert response.status_code == 200
     assert response.json()["mode"] == "openai"
     assert response.json()["evidence"][0]["used_in_answer"] is True
+
+
+def test_company_opportunity_report_explains_score_and_next_actions(client):
+    imported = client.post(
+        "/api/import/csv",
+        files={
+            "file": (
+                "report.csv",
+                (
+                    "name,category,city,state,source_url,verification_status,"
+                    "project_name,project_status\n"
+                    "Varuna Homes,Builder,Varanasi,Uttar Pradesh,"
+                    "https://example.com/varuna,verified,River Homes,announced\n"
+                ).encode(),
+                "text/csv",
+            )
+        },
+    )
+    assert imported.status_code == 200
+    company = client.get("/api/companies").json()[0]
+
+    response = client.get(f"/api/companies/{company['id']}")
+
+    assert response.status_code == 200
+    report = response.json()["opportunity_report"]
+    assert report["score"] == company["score"]
+    assert sum(item["points"] for item in report["score_components"]) == report["score"]
+    assert report["evidence_summary"]["verified_sources"] == 1
+    assert report["human_review_required"] is True
+    assert any("business contact" in item.lower() for item in report["evidence_gaps"])
+    assert report["recommended_actions"]
+
+
+def test_ai_company_enrichment_uses_verified_evidence_and_does_not_persist(
+    client, monkeypatch
+):
+    import app.workflows.research as research
+
+    csv_content = (
+        "name,category,city,state,source_url,source_title,verification_status,source_content\n"
+        "Varuna Developers,Builder,Varanasi,Uttar Pradesh,https://example.com/verified,"
+        "Project notice,verified,Construction of River Homes begins in April.\n"
+        "Varuna Developers,Builder,Varanasi,Uttar Pradesh,https://example.com/unverified,"
+        "Unreviewed notice,unverified,Unreviewed content must not leave the app.\n"
+    )
+    imported = client.post(
+        "/api/import/csv",
+        files={"file": ("market.csv", csv_content.encode(), "text/csv")},
+    )
+    assert imported.status_code == 200
+    company = client.get("/api/companies").json()[0]
+    monkeypatch.setenv("RAG_OPENAI_API_KEY", "test-token")
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return None
+
+        def read(self, _size=-1):
+            return json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "claims": [
+                                            {
+                                                "claim_type": "timeline",
+                                                "text": "Construction begins in April.",
+                                                "source_id": 1,
+                                                "quote": "Construction of River Homes begins in April.",
+                                            }
+                                        ]
+                                    }
+                                )
+                            }
+                        }
+                    ]
+                }
+            ).encode()
+
+    def fake_urlopen(request, timeout):
+        body = json.loads(request.data)
+        prompt = body["messages"][1]["content"]
+        assert timeout == 30
+        assert "Construction of River Homes begins in April." in prompt
+        assert "Unreviewed content must not leave the app." not in prompt
+        return FakeResponse()
+
+    monkeypatch.setattr(research, "urlopen", fake_urlopen)
+    response = client.post(f"/api/companies/{company['id']}/ai-enrichment")
+
+    assert response.status_code == 200
+    result = response.json()
+    assert result["persisted"] is False
+    assert result["human_review_required"] is True
+    assert result["claims"][0]["citation"] == "S1"
+    assert result["claims"][0]["source_url"] == "https://example.com/verified"
+
+
+def test_ai_company_enrichment_rejects_ungrounded_claims(client, monkeypatch):
+    import app.workflows.research as research
+
+    imported = client.post(
+        "/api/import/csv",
+        files={
+            "file": (
+                "verified.csv",
+                (
+                    "name,category,city,state,source_url,verification_status,source_content\n"
+                    "Varuna Developers,Builder,Varanasi,Uttar Pradesh,"
+                    "https://example.com/verified,verified,Public source excerpt.\n"
+                ).encode(),
+                "text/csv",
+            )
+        },
+    )
+    assert imported.status_code == 200
+    company = client.get("/api/companies").json()[0]
+    monkeypatch.setenv("RAG_OPENAI_API_KEY", "test-token")
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return None
+
+        def read(self, _size=-1):
+            return json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "claims": [
+                                            {
+                                                "claim_type": "project",
+                                                "text": "An invented project is underway.",
+                                                "source_id": 1,
+                                                "quote": "An invented project is underway.",
+                                            }
+                                        ]
+                                    }
+                                )
+                            }
+                        }
+                    ]
+                }
+            ).encode()
+
+    monkeypatch.setattr(research, "urlopen", lambda *_args, **_kwargs: FakeResponse())
+
+    response = client.post(f"/api/companies/{company['id']}/ai-enrichment")
+
+    assert response.status_code == 502
+    assert "could not be grounded" in response.json()["detail"]

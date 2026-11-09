@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import csv
 import io
+from datetime import date
+import math
+import re
 from typing import Any, TypedDict
 from urllib.parse import urlparse
 
@@ -13,6 +16,7 @@ from sqlalchemy.orm import Session
 REQUIRED_COLUMNS = {"name", "category", "city", "state", "source_url"}
 VERIFICATION_STATES = {"verified", "unverified", "rejected"}
 DEMAND_CONFIDENCE = {"unknown", "low", "medium", "high"}
+CONTACT_EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 CATEGORY_POINTS = {
     "architect": 30,
     "architecture firm": 30,
@@ -22,6 +26,22 @@ CATEGORY_POINTS = {
     "contractor": 24,
     "construction company": 24,
     "dealer": 15,
+}
+FIELD_LIMITS = {
+    "name": 200,
+    "category": 80,
+    "city": 100,
+    "state": 100,
+    "website": 500,
+    "public_phone": 50,
+    "source_url": 1000,
+    "source_title": 300,
+    "source_type": 80,
+    "project_name": 200,
+    "project_location": 200,
+    "project_status": 80,
+    "estimate_basis": 300,
+    "demand_confidence": 20,
 }
 
 
@@ -83,17 +103,59 @@ def validate_and_normalize(state: ImportState) -> dict:
     for row in state["records"]:
         number = row["row_number"]
         record = {key: value.strip() for key, value in row.items() if isinstance(value, str)}
+        for field in ("name", "category", "city", "state"):
+            if field in record:
+                record[field] = " ".join(record[field].split())
         missing = [key for key in ("name", "category", "city", "state", "source_url") if not record.get(key)]
         if missing:
             errors.append(f"Row {number}: {', '.join(missing)} are required")
             continue
+        over_limit = [
+            f"{field} must be {limit} characters or fewer"
+            for field, limit in FIELD_LIMITS.items()
+            if len(record.get(field, "")) > limit
+        ]
+        if over_limit:
+            errors.extend(f"Row {number}: {message}" for message in over_limit)
+            continue
         if len(record.get("source_content", "")) > 20000:
             errors.append(f"Row {number}: source_content must be 20,000 characters or fewer")
             continue
+        if any(
+            record.get(field)
+            for field in ("contact_role", "contact_email", "contact_phone")
+        ) and not record.get("contact_name"):
+            errors.append(f"Row {number}: contact_name is required when contact fields are supplied")
+            continue
+        contact_email = record.get("contact_email", "")
+        if contact_email and (
+            len(contact_email) > 255 or not CONTACT_EMAIL_PATTERN.fullmatch(contact_email)
+        ):
+            errors.append(f"Row {number}: contact_email must be a valid business email")
+            continue
+        if len(record.get("contact_name", "")) > 200:
+            errors.append(f"Row {number}: contact_name must be 200 characters or fewer")
+            continue
+        if len(record.get("contact_role", "")) > 120:
+            errors.append(f"Row {number}: contact_role must be 120 characters or fewer")
+            continue
+        if len(record.get("contact_phone", "")) > 50:
+            errors.append(f"Row {number}: contact_phone must be 50 characters or fewer")
+            continue
 
         parsed_url = urlparse(record["source_url"])
-        if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+        if (
+            parsed_url.scheme not in {"http", "https"}
+            or not parsed_url.hostname
+            or parsed_url.username is not None
+            or parsed_url.password is not None
+        ):
             errors.append(f"Row {number}: source_url must be an http or https URL")
+            continue
+        try:
+            parsed_url.port
+        except ValueError:
+            errors.append(f"Row {number}: source_url has an invalid port")
             continue
 
         verification = (record.get("verification_status") or "unverified").lower()
@@ -122,7 +184,7 @@ def validate_and_normalize(state: ImportState) -> dict:
         if raw_doors_per_unit:
             try:
                 doors_per_unit = float(raw_doors_per_unit)
-                if not 0 <= doors_per_unit <= 100:
+                if not math.isfinite(doors_per_unit) or not 0 <= doors_per_unit <= 100:
                     raise ValueError
                 record["doors_per_unit"] = doors_per_unit
             except ValueError:
@@ -139,6 +201,24 @@ def validate_and_normalize(state: ImportState) -> dict:
             invalid = True
         record["demand_confidence"] = confidence
         record["verification_status"] = verification
+        raw_discovered_at = record.get("discovered_at", "")
+        try:
+            if raw_discovered_at and (
+                len(raw_discovered_at) != 10
+                or raw_discovered_at[4] != "-"
+                or raw_discovered_at[7] != "-"
+            ):
+                raise ValueError
+            record["discovered_at"] = (
+                date.fromisoformat(raw_discovered_at) if raw_discovered_at else date.today()
+            )
+        except ValueError:
+            errors.append(f"Row {number}: discovered_at must use YYYY-MM-DD")
+            invalid = True
+        else:
+            if record["discovered_at"] > date.today():
+                errors.append(f"Row {number}: discovered_at cannot be in the future")
+                invalid = True
         if not invalid:
             records.append(record)
 
@@ -157,6 +237,7 @@ def deduplicate(state: ImportState) -> dict:
         key = (
             record["name"].casefold(),
             record["city"].casefold(),
+            record["state"].casefold(),
             record["source_url"].casefold(),
             record.get("project_name", "").casefold(),
         )
@@ -215,15 +296,38 @@ def enrich_and_score(state: ImportState) -> dict:
 
 
 def persist_records(state: ImportState) -> dict:
-    from app.main import Company, Project, Source
+    from app.main import Company, CompanyPerson, Location, Person, Project, Source
 
     db = state["db"]
     created_companies = created_sources = created_projects = content_sources = 0
+
+    def get_location(city: str, state_name: str) -> Location:
+        city_key = " ".join(city.split()).casefold()
+        state_key = " ".join(state_name.split()).casefold()
+        location = db.scalar(
+            select(Location).where(
+                Location.state_key == state_key,
+                Location.city_key == city_key,
+            )
+        )
+        if location is None:
+            location = Location(
+                city=" ".join(city.split()),
+                state=" ".join(state_name.split()),
+                city_key=city_key,
+                state_key=state_key,
+            )
+            db.add(location)
+            db.flush()
+        return location
+
     for row in state["records"]:
+        location = get_location(row["city"], row["state"])
         company = db.scalar(
             select(Company).where(
                 func.lower(Company.name) == row["name"].casefold(),
                 func.lower(Company.city) == row["city"].casefold(),
+                func.lower(Company.state) == row["state"].casefold(),
             )
         )
         if company is None:
@@ -235,10 +339,13 @@ def persist_records(state: ImportState) -> dict:
                 website=row.get("website") or None,
                 public_phone=row.get("public_phone") or None,
                 description=row.get("description") or None,
+                location=location,
             )
             db.add(company)
             db.flush()
             created_companies += 1
+        elif company.location_id is None:
+            company.location = location
 
         project_name = row.get("project_name", "")
         project = next(
@@ -257,10 +364,21 @@ def persist_records(state: ImportState) -> dict:
                 estimate_basis=row.get("estimate_basis") or None,
                 demand_confidence=row["demand_confidence"],
                 demand_notes=row.get("demand_notes") or None,
+                location_ref=(
+                    location
+                    if " ".join(row.get("project_location", "").split()).casefold()
+                    == " ".join(row["city"].split()).casefold()
+                    else None
+                ),
             )
             db.add(project)
             created_projects += 1
         elif project is not None:
+            if project.location_id is None and (
+                " ".join((project.location or "").split()).casefold()
+                == " ".join(row["city"].split()).casefold()
+            ):
+                project.location_ref = location
             if project.estimated_units is None:
                 project.estimated_units = row.get("estimated_units")
             if project.estimated_doors is None:
@@ -276,23 +394,80 @@ def persist_records(state: ImportState) -> dict:
             None,
         )
         source_content = row.get("source_content", "").strip()
-        if existing_source is None:
-            db.add(
-                Source(
-                    company=company,
-                    project=project,
-                    url=source_url,
-                    title=row.get("source_title") or None,
-                    source_type=row.get("source_type") or "website",
-                    verification_status=row["verification_status"],
-                    content=source_content or None,
+        if row.get("contact_name"):
+            contact_email = row.get("contact_email", "").casefold() or None
+            person = (
+                db.scalar(
+                    select(Person).where(Person.business_email == contact_email)
                 )
+                if contact_email
+                else None
             )
+            if person is None:
+                matching_contacts = db.scalars(
+                    select(Person)
+                    .join(CompanyPerson)
+                    .where(
+                        CompanyPerson.company_id == company.id,
+                        func.lower(Person.name) == row["contact_name"].casefold(),
+                        CompanyPerson.job_title == (row.get("contact_role") or None),
+                    )
+                ).all()
+                person = next(
+                    (
+                        item
+                        for item in matching_contacts
+                        if item.business_phone == (row.get("contact_phone") or None)
+                    ),
+                    None,
+                )
+            if person is None:
+                person = Person(
+                    name=row["contact_name"],
+                    business_email=contact_email,
+                    business_phone=row.get("contact_phone") or None,
+                )
+                db.add(person)
+                db.flush()
+            else:
+                if person.business_email is None:
+                    person.business_email = contact_email
+                if person.business_phone is None:
+                    person.business_phone = row.get("contact_phone") or None
+
+        if existing_source is None:
+            existing_source = Source(
+                company=company,
+                project=project,
+                url=source_url,
+                title=row.get("source_title") or None,
+                source_type=row.get("source_type") or "website",
+                verification_status=row["verification_status"],
+                content=source_content or None,
+                discovered_at=row["discovered_at"],
+            )
+            db.add(existing_source)
             created_sources += 1
             content_sources += int(bool(source_content))
         elif source_content and not existing_source.content:
             existing_source.content = source_content
             content_sources += 1
+        if row.get("contact_name"):
+            link = db.get(CompanyPerson, (company.id, person.id))
+            if link is None:
+                db.add(
+                    CompanyPerson(
+                        company=company,
+                        person=person,
+                        job_title=row.get("contact_role") or None,
+                        source=existing_source,
+                    )
+                )
+            else:
+                if link.job_title is None:
+                    link.job_title = row.get("contact_role") or None
+                if link.source_id is None:
+                    link.source = existing_source
 
     counts = {
         "companies_created": created_companies,

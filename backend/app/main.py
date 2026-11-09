@@ -14,10 +14,12 @@ from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, Respo
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import (
+    CheckConstraint,
     Date,
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     JSON,
     String,
@@ -33,7 +35,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, joinedload, mapped_column, relationship, sessionmaker
 from pwdlib import PasswordHash
 from app.workflows.prospect_import import run_prospect_import
-from app.workflows.research import run_research
+from app.workflows.research import run_company_enrichment, run_research
 
 
 DATABASE_URL = os.getenv(
@@ -52,7 +54,14 @@ class Base(DeclarativeBase):
 
 class Company(Base):
     __tablename__ = "companies"
-    __table_args__ = (UniqueConstraint("name", "city", name="uq_company_name_city"),)
+    __table_args__ = (
+        UniqueConstraint("name", "city", "state", name="uq_company_name_city_state"),
+        Index("ix_companies_state_city", "state", "city"),
+        CheckConstraint("length(trim(name)) > 0", name="ck_companies_name_nonempty"),
+        CheckConstraint("length(trim(category)) > 0", name="ck_companies_category_nonempty"),
+        CheckConstraint("length(trim(city)) > 0", name="ck_companies_city_nonempty"),
+        CheckConstraint("length(trim(state)) > 0", name="ck_companies_state_nonempty"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(200), index=True)
@@ -62,11 +71,14 @@ class Company(Base):
     website: Mapped[str | None] = mapped_column(String(500))
     public_phone: Mapped[str | None] = mapped_column(String(50))
     description: Mapped[str | None] = mapped_column(Text)
+    location_id: Mapped[int | None] = mapped_column(ForeignKey("locations.id", ondelete="RESTRICT"), index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
+    location: Mapped[Location | None] = relationship(back_populates="companies")
     sources: Mapped[list[Source]] = relationship(back_populates="company", cascade="all, delete-orphan")
     projects: Mapped[list[Project]] = relationship(back_populates="company", cascade="all, delete-orphan")
+    contacts: Mapped[list[CompanyPerson]] = relationship(back_populates="company", cascade="all, delete-orphan")
     activities: Mapped[list[Activity]] = relationship(
         back_populates="company", cascade="all, delete-orphan"
     )
@@ -74,6 +86,19 @@ class Company(Base):
 
 class Project(Base):
     __tablename__ = "projects"
+    __table_args__ = (
+        CheckConstraint("estimated_units IS NULL OR estimated_units >= 0", name="ck_projects_units_nonnegative"),
+        CheckConstraint("estimated_doors IS NULL OR estimated_doors >= 0", name="ck_projects_doors_nonnegative"),
+        CheckConstraint(
+            "doors_per_unit IS NULL OR (doors_per_unit >= 0 AND doors_per_unit <= 100)",
+            name="ck_projects_doors_per_unit_range",
+        ),
+        CheckConstraint(
+            "demand_confidence IN ('unknown', 'low', 'medium', 'high')",
+            name="ck_projects_demand_confidence",
+        ),
+        Index("ix_projects_status_name", "status", "name"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     company_id: Mapped[int] = mapped_column(ForeignKey("companies.id", ondelete="CASCADE"), index=True)
@@ -86,13 +111,22 @@ class Project(Base):
     estimate_basis: Mapped[str | None] = mapped_column(String(300))
     demand_confidence: Mapped[str] = mapped_column(String(20), default="unknown")
     demand_notes: Mapped[str | None] = mapped_column(Text)
+    location_id: Mapped[int | None] = mapped_column(ForeignKey("locations.id", ondelete="RESTRICT"), index=True)
     company: Mapped[Company] = relationship(back_populates="projects")
+    location_ref: Mapped[Location | None] = relationship(back_populates="projects")
     sources: Mapped[list[Source]] = relationship(back_populates="project", cascade="all, delete-orphan")
     relationships: Mapped[list[BusinessRelationship]] = relationship(back_populates="project")
 
 
 class Source(Base):
     __tablename__ = "sources"
+    __table_args__ = (
+        CheckConstraint(
+            "verification_status IN ('verified', 'unverified', 'rejected')",
+            name="ck_sources_verification_status",
+        ),
+        Index("ix_sources_verification_discovered", "verification_status", "discovered_at"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     company_id: Mapped[int | None] = mapped_column(
@@ -109,6 +143,62 @@ class Source(Base):
     discovered_at: Mapped[date] = mapped_column(Date, default=date.today)
     company: Mapped[Company | None] = relationship(back_populates="sources")
     project: Mapped[Project | None] = relationship(back_populates="sources")
+
+
+class Location(Base):
+    __tablename__ = "locations"
+    __table_args__ = (
+        UniqueConstraint("state_key", "city_key", name="uq_locations_state_city"),
+        CheckConstraint("length(trim(city)) > 0", name="ck_locations_city_nonempty"),
+        CheckConstraint("length(trim(state)) > 0", name="ck_locations_state_nonempty"),
+        Index("ix_locations_state_city", "state", "city"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    city: Mapped[str] = mapped_column(String(100))
+    state: Mapped[str] = mapped_column(String(100))
+    city_key: Mapped[str] = mapped_column(String(100))
+    state_key: Mapped[str] = mapped_column(String(100))
+    companies: Mapped[list[Company]] = relationship(back_populates="location")
+    projects: Mapped[list[Project]] = relationship(back_populates="location_ref")
+
+
+class Person(Base):
+    __tablename__ = "people"
+    __table_args__ = (
+        CheckConstraint("length(trim(name)) > 0", name="ck_people_name_nonempty"),
+        Index("ix_people_name", "name"),
+        Index("uq_people_business_email", func.lower(text("business_email")), unique=True),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(200))
+    business_email: Mapped[str | None] = mapped_column(String(255))
+    business_phone: Mapped[str | None] = mapped_column(String(50))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+    companies: Mapped[list[CompanyPerson]] = relationship(back_populates="person", cascade="all, delete-orphan")
+
+
+class CompanyPerson(Base):
+    __tablename__ = "company_people"
+    __table_args__ = (
+        CheckConstraint("length(trim(job_title)) > 0", name="ck_company_people_job_title_nonempty"),
+        Index("ix_company_people_person_id", "person_id"),
+    )
+
+    company_id: Mapped[int] = mapped_column(
+        ForeignKey("companies.id", ondelete="CASCADE"), primary_key=True
+    )
+    person_id: Mapped[int] = mapped_column(
+        ForeignKey("people.id", ondelete="CASCADE"), primary_key=True
+    )
+    job_title: Mapped[str | None] = mapped_column(String(120))
+    source_id: Mapped[int | None] = mapped_column(ForeignKey("sources.id", ondelete="SET NULL"))
+    company: Mapped[Company] = relationship(back_populates="contacts")
+    person: Mapped[Person] = relationship(back_populates="companies")
+    source: Mapped[Source | None] = relationship()
 
 
 class BusinessRelationship(Base):
@@ -135,18 +225,35 @@ class BusinessRelationship(Base):
 
 class Activity(Base):
     __tablename__ = "activities"
+    __table_args__ = (
+        CheckConstraint("length(trim(activity_type)) > 0", name="ck_activities_type_nonempty"),
+        CheckConstraint("length(trim(notes)) > 0", name="ck_activities_notes_nonempty"),
+        CheckConstraint(
+            "sales_outcome IS NULL OR sales_outcome IN "
+            "('contacted', 'interested', 'qualified', 'proposal_sent', "
+            "'won', 'lost', 'not_interested', 'no_response')",
+            name="ck_activities_sales_outcome",
+        ),
+        Index("ix_activities_company_created", "company_id", "created_at"),
+        Index("ix_activities_due_date_completed", "due_date", "completed_at"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     company_id: Mapped[int] = mapped_column(ForeignKey("companies.id", ondelete="CASCADE"), index=True)
+    person_id: Mapped[int | None] = mapped_column(ForeignKey("people.id", ondelete="SET NULL"), index=True)
+    project_id: Mapped[int | None] = mapped_column(ForeignKey("projects.id", ondelete="SET NULL"), index=True)
     activity_type: Mapped[str] = mapped_column(String(50))
     notes: Mapped[str] = mapped_column(Text)
     next_action: Mapped[str | None] = mapped_column(String(300))
+    sales_outcome: Mapped[str | None] = mapped_column(String(30))
     due_date: Mapped[date | None] = mapped_column(Date)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
     company: Mapped[Company] = relationship(back_populates="activities")
+    person: Mapped[Person | None] = relationship()
+    project: Mapped[Project | None] = relationship()
 
 
 class User(Base):
@@ -206,7 +313,21 @@ class ActivityInput(BaseModel):
     activity_type: str = Field(min_length=1, max_length=50)
     notes: str = Field(min_length=1, max_length=4000)
     next_action: str | None = Field(default=None, max_length=300)
+    sales_outcome: str | None = Field(
+        default=None,
+        pattern="^(contacted|interested|qualified|proposal_sent|won|lost|not_interested|no_response)$",
+    )
     due_date: date | None = None
+    person_id: int | None = None
+    project_id: int | None = None
+
+    @field_validator("activity_type", "notes")
+    @classmethod
+    def values_must_not_be_blank(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("Activity type and notes cannot be blank")
+        return normalized
 
 
 class RelationshipInput(BaseModel):
@@ -266,7 +387,7 @@ class SavedSearchInput(BaseModel):
     @field_validator("filters")
     @classmethod
     def only_supported_filters(cls, value: dict):
-        supported = {"q", "category", "city", "verification", "has_project"}
+        supported = {"q", "category", "city", "state", "verification", "has_project"}
         if not set(value).issubset(supported):
             raise ValueError("Saved search contains unsupported filters")
         return value
@@ -275,7 +396,7 @@ class SavedSearchInput(BaseModel):
 class ProjectDemandInput(BaseModel):
     estimated_units: int | None = Field(default=None, ge=0)
     estimated_doors: int | None = Field(default=None, ge=0)
-    doors_per_unit: float | None = Field(default=None, ge=0, le=100)
+    doors_per_unit: float | None = Field(default=None, ge=0, le=100, allow_inf_nan=False)
     estimate_basis: str | None = Field(default=None, max_length=300)
     demand_confidence: str = Field(default="unknown", pattern="^(unknown|low|medium|high)$")
     demand_notes: str | None = Field(default=None, max_length=4000)
@@ -389,14 +510,183 @@ def lead_score(company: Company) -> dict:
     category = company.category.lower()
     base = next((points for label, points in category_points.items() if label in category), 10)
     verified = sum(source.verification_status == "verified" for source in company.sources)
+    evidence_points = min(20 + (verified - 1) * 5, 30) if verified else 0
     project_points = min(len(company.projects) * 10, 30)
-    score = min(base + (20 if verified else 0) + project_points, 100)
+    website_points = 5 if getattr(company, "website", None) else 0
+    contact_points = 5 if getattr(company, "contacts", []) else 0
+    score = base + evidence_points + project_points + website_points + contact_points
     reasons = [f"{company.category} is a relevant prospect category (+{base})."]
     if verified:
-        reasons.append(f"{verified} source(s) have been verified (+20).")
+        reasons.append(f"{verified} source(s) have been verified (+{evidence_points}).")
     if company.projects:
         reasons.append(f"{len(company.projects)} linked project(s) (+{project_points}).")
-    return {"score": score, "reasons": reasons}
+    if website_points:
+        reasons.append("A public company website is recorded (+5).")
+    if contact_points:
+        reasons.append("A professional business contact is linked (+5).")
+    return {
+        "score": score,
+        "reasons": reasons,
+        "components": [
+            {"key": "business_relevance", "label": "Business relevance", "points": base, "maximum": 30},
+            {"key": "verified_evidence", "label": "Verified evidence", "points": evidence_points, "maximum": 30},
+            {"key": "project_signals", "label": "Project signals", "points": project_points, "maximum": 30},
+            {"key": "public_website", "label": "Public website", "points": website_points, "maximum": 5},
+            {"key": "business_contact", "label": "Business contact", "points": contact_points, "maximum": 5},
+        ],
+    }
+
+
+def company_opportunity_report(company: Company, score: dict) -> dict:
+    verified_sources = sum(source.verification_status == "verified" for source in company.sources)
+    unverified_sources = sum(source.verification_status == "unverified" for source in company.sources)
+    rejected_sources = sum(source.verification_status == "rejected" for source in company.sources)
+    evidence_gaps = []
+    recommended_actions = []
+
+    if not verified_sources:
+        evidence_gaps.append("No source has been verified.")
+        recommended_actions.append(
+            "Review a public company or project source and verify its claims before outreach."
+        )
+    if rejected_sources:
+        evidence_gaps.append(f"{rejected_sources} source(s) were rejected and excluded.")
+    if not company.projects:
+        evidence_gaps.append("No project is linked to this company.")
+        recommended_actions.append(
+            "Check reviewed public announcements and project portfolios for a relevant active project."
+        )
+    elif any(project.demand_confidence == "unknown" for project in company.projects):
+        evidence_gaps.append("At least one linked project has unknown demand confidence.")
+        recommended_actions.append(
+            "Confirm project phase, scope, and material requirements from a primary source."
+        )
+    if not company.website:
+        evidence_gaps.append("No public company website is recorded.")
+    if not company.contacts:
+        evidence_gaps.append("No professional business contact is linked.")
+        recommended_actions.append(
+            "Identify and verify a role-relevant professional contact using permitted public sources."
+        )
+    if verified_sources and company.projects and company.contacts:
+        recommended_actions.append(
+            "Prioritize a human-reviewed outreach that references the verified project evidence."
+        )
+
+    open_follow_ups = sorted(
+        (
+            activity
+            for activity in company.activities
+            if activity.completed_at is None and activity.next_action
+        ),
+        key=lambda activity: (
+            activity.due_date is None,
+            activity.due_date or date.max,
+            activity.created_at,
+        ),
+    )
+    latest_outcome = next(
+        (
+            activity.sales_outcome
+            for activity in sorted(
+                company.activities,
+                key=lambda activity: (activity.created_at, activity.id),
+                reverse=True,
+            )
+            if activity.sales_outcome
+        ),
+        None,
+    )
+    if open_follow_ups:
+        activity = open_follow_ups[0]
+        next_sales_action = {
+            "action": activity.next_action,
+            "reason": "Complete the open follow-up already recorded for this prospect.",
+            "due_date": activity.due_date.isoformat() if activity.due_date else None,
+            "activity_id": activity.id,
+            "status": "scheduled",
+        }
+    elif latest_outcome in {"lost", "not_interested"}:
+        next_sales_action = {
+            "action": "Pause proactive outreach and respect the recorded sales outcome.",
+            "reason": f"The latest recorded sales outcome is {latest_outcome.replace('_', ' ')}.",
+            "due_date": None,
+            "activity_id": None,
+            "status": "paused",
+        }
+    elif latest_outcome == "won":
+        next_sales_action = {
+            "action": "Schedule an account check-in and confirm the next project requirement.",
+            "reason": "The latest recorded sales outcome is a win.",
+            "due_date": None,
+            "activity_id": None,
+            "status": "recommended",
+        }
+    elif not verified_sources:
+        next_sales_action = {
+            "action": "Review and verify a public company or project source.",
+            "reason": "No verified evidence is available to support personalized outreach.",
+            "due_date": None,
+            "activity_id": None,
+            "status": "recommended",
+        }
+    elif not company.projects:
+        next_sales_action = {
+            "action": "Research a relevant active project using permitted public sources.",
+            "reason": "No project is linked to this prospect.",
+            "due_date": None,
+            "activity_id": None,
+            "status": "recommended",
+        }
+    elif not company.contacts:
+        next_sales_action = {
+            "action": "Identify and verify a role-relevant professional business contact.",
+            "reason": "No professional contact is linked to this prospect.",
+            "due_date": None,
+            "activity_id": None,
+            "status": "recommended",
+        }
+    elif any(project.demand_confidence == "unknown" for project in company.projects):
+        next_sales_action = {
+            "action": "Confirm the project phase, scope, and material requirements.",
+            "reason": "Project demand confidence is unknown.",
+            "due_date": None,
+            "activity_id": None,
+            "status": "recommended",
+        }
+    else:
+        next_sales_action = {
+            "action": "Prepare a personalized outreach referencing the verified project evidence.",
+            "reason": "The prospect has verified evidence, a linked project, and a business contact.",
+            "due_date": None,
+            "activity_id": None,
+            "status": "recommended",
+        }
+
+    return {
+        "score": score["score"],
+        "score_components": score["components"],
+        "priority": (
+            "high"
+            if score["score"] >= 70 and verified_sources
+            else "medium"
+            if score["score"] >= 40
+            else "low"
+        ),
+        "positive_signals": score["reasons"],
+        "evidence_gaps": evidence_gaps,
+        "recommended_actions": recommended_actions,
+        "next_sales_action": next_sales_action,
+        "latest_sales_outcome": latest_outcome,
+        "evidence_summary": {
+            "verified_sources": verified_sources,
+            "unverified_sources": unverified_sources,
+            "rejected_sources": rejected_sources,
+            "projects": len(company.projects),
+            "professional_contacts": len(company.contacts),
+        },
+        "human_review_required": True,
+    }
 
 
 def company_summary(company: Company) -> dict:
@@ -411,6 +701,7 @@ def company_summary(company: Company) -> dict:
         "public_phone": company.public_phone,
         "score": score["score"],
         "score_reasons": score["reasons"],
+        "score_components": score["components"],
         "verified_source_count": sum(
             source.verification_status == "verified" for source in company.sources
         ),
@@ -517,6 +808,22 @@ def create_user(
 def dashboard_summary(
     db: Session = Depends(get_db), _: User = Depends(current_user)
 ) -> dict:
+    next_activity = db.execute(
+        select(Activity, Company)
+        .join(Company, Activity.company_id == Company.id)
+        .where(
+            Activity.next_action.is_not(None),
+            Activity.next_action != "",
+            Activity.completed_at.is_(None),
+        )
+        .order_by(
+            Activity.due_date.is_(None),
+            Activity.due_date,
+            Activity.created_at,
+            Activity.id,
+        )
+        .limit(1)
+    ).first()
     return {
         "companies": db.scalar(select(func.count()).select_from(Company)) or 0,
         "projects": db.scalar(select(func.count()).select_from(Project)) or 0,
@@ -532,6 +839,21 @@ def dashboard_summary(
                 Activity.completed_at.is_(None),
             )
         ) or 0,
+        "next_action": (
+            {
+                "activity_id": next_activity.Activity.id,
+                "company_id": next_activity.Company.id,
+                "company_name": next_activity.Company.name,
+                "action": next_activity.Activity.next_action,
+                "due_date": (
+                    next_activity.Activity.due_date.isoformat()
+                    if next_activity.Activity.due_date
+                    else None
+                ),
+            }
+            if next_activity
+            else None
+        ),
     }
 
 
@@ -541,6 +863,7 @@ def list_companies(
     q: str | None = None,
     category: str | None = None,
     city: str | None = None,
+    state: str | None = None,
     verification: str | None = Query(default=None, pattern="^(verified|unverified)$"),
     has_project: bool | None = None,
     limit: int = Query(default=100, ge=1, le=500),
@@ -552,12 +875,19 @@ def list_companies(
     if q:
         term = f"%{q.strip()}%"
         filters.append(
-            or_(Company.name.ilike(term), Company.category.ilike(term), Company.city.ilike(term))
+            or_(
+                Company.name.ilike(term),
+                Company.category.ilike(term),
+                Company.city.ilike(term),
+                Company.state.ilike(term),
+            )
         )
     if category:
         filters.append(Company.category == category)
     if city:
         filters.append(Company.city.ilike(f"%{city.strip()}%"))
+    if state:
+        filters.append(Company.state.ilike(f"%{state.strip()}%"))
     if verification == "verified":
         filters.append(
             Company.sources.any(Source.verification_status == "verified")
@@ -584,6 +914,7 @@ def list_companies(
 def get_knowledge_graph(
     q: str | None = None,
     city: str | None = None,
+    state: str | None = None,
     limit: int = Query(default=100, ge=1, le=200),
     db: Session = Depends(get_db),
     _: User = Depends(current_user),
@@ -592,10 +923,17 @@ def get_knowledge_graph(
     if q and q.strip():
         term = f"%{q.strip()}%"
         company_filters.append(
-            or_(Company.name.ilike(term), Company.category.ilike(term), Company.city.ilike(term))
+            or_(
+                Company.name.ilike(term),
+                Company.category.ilike(term),
+                Company.city.ilike(term),
+                Company.state.ilike(term),
+            )
         )
     if city and city.strip():
         company_filters.append(Company.city.ilike(f"%{city.strip()}%"))
+    if state and state.strip():
+        company_filters.append(Company.state.ilike(f"%{state.strip()}%"))
 
     company_query = (
         select(Company)
@@ -727,9 +1065,28 @@ def get_company(
             )
         )
     ).all()
+    summary = company_summary(company)
     return {
-        **company_summary(company),
+        **summary,
         "description": company.description,
+        "opportunity_report": company_opportunity_report(company, lead_score(company)),
+        "contacts": [
+            {
+                "id": link.person.id,
+                "name": link.person.name,
+                "business_email": link.person.business_email,
+                "business_phone": link.person.business_phone,
+                "job_title": link.job_title,
+                "source_url": link.source.url if link.source else None,
+                "verification_status": (
+                    link.source.verification_status if link.source else None
+                ),
+                "discovered_at": (
+                    link.source.discovered_at.isoformat() if link.source else None
+                ),
+            }
+            for link in company.contacts
+        ],
         "sources": [
             {
                 "id": source.id,
@@ -738,6 +1095,7 @@ def get_company(
                 "source_type": source.source_type,
                 "verification_status": source.verification_status,
                 "discovered_at": source.discovered_at.isoformat(),
+                "has_content": bool(source.content and source.content.strip()),
             }
             for source in company.sources
         ],
@@ -775,13 +1133,64 @@ def get_company(
                 "id": activity.id,
                 "activity_type": activity.activity_type,
                 "notes": activity.notes,
+                "person_id": activity.person_id,
+                "person_name": activity.person.name if activity.person else None,
+                "project_id": activity.project_id,
+                "project_name": activity.project.name if activity.project else None,
                 "next_action": activity.next_action,
+                "sales_outcome": activity.sales_outcome,
                 "due_date": activity.due_date.isoformat() if activity.due_date else None,
                 "completed_at": activity.completed_at.isoformat() if activity.completed_at else None,
                 "created_at": activity.created_at.isoformat(),
             }
             for activity in sorted(company.activities, key=lambda item: item.created_at, reverse=True)
         ],
+    }
+
+
+@app.post("/api/companies/{company_id}/ai-enrichment")
+def enrich_company_with_ai(
+    company_id: int,
+    db: Session = Depends(get_db),
+    actor: User = Depends(current_user),
+) -> dict:
+    company = db.get(Company, company_id)
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+    verified_sources = sorted(
+        (
+            source for source in company.sources
+            if source.verification_status == "verified" and source.content
+        ),
+        key=lambda source: (source.discovered_at, source.id),
+        reverse=True,
+    )[:5]
+    try:
+        result = run_company_enrichment(company.name, verified_sources)
+    except RuntimeError as exc:
+        status_code = 503 if "not configured" in str(exc) else 502
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+
+    audit(
+        db,
+        actor,
+        "ai_enrichment",
+        "company",
+        str(company.id),
+        {
+            "claims": len(result["claims"]),
+            "sources_used": len(result["sources_used"]),
+            "model": result["model"],
+            "persisted": False,
+        },
+    )
+    db.commit()
+    return {
+        **result,
+        "company_id": company.id,
+        "company_name": company.name,
+        "persisted": False,
+        "human_review_required": True,
     }
 
 
@@ -794,6 +1203,20 @@ def create_activity(
 ) -> dict:
     if not db.get(Company, company_id):
         raise HTTPException(status_code=404, detail="Company not found")
+    if payload.person_id is not None and not db.scalar(
+        select(CompanyPerson).where(
+            CompanyPerson.company_id == company_id,
+            CompanyPerson.person_id == payload.person_id,
+        )
+    ):
+        raise HTTPException(status_code=422, detail="Contact must be linked to this company")
+    if payload.project_id is not None and not db.scalar(
+        select(Project.id).where(
+            Project.id == payload.project_id,
+            Project.company_id == company_id,
+        )
+    ):
+        raise HTTPException(status_code=422, detail="Project must belong to this company")
     activity = Activity(company_id=company_id, **payload.model_dump())
     db.add(activity)
     db.flush()
@@ -1009,7 +1432,7 @@ def research_status(_: User = Depends(current_user)) -> dict:
         "generation_available": bool(os.getenv("RAG_OPENAI_API_KEY", "").strip()),
         "provider": "OpenAI-compatible API",
         "model": os.getenv("RAG_OPENAI_MODEL", "gpt-4o-mini"),
-        "privacy": "Only source excerpts marked verified are sent when AI answers are explicitly requested.",
+        "privacy": "AI is opt-in. Only verified source excerpts are sent for explicitly requested answers or enrichment.",
     }
 
 
@@ -1075,17 +1498,88 @@ async def import_csv(
 def export_csv(
     db: Session = Depends(get_db), _: User = Depends(current_user)
 ):
-    companies = db.scalars(select(Company).order_by(Company.name)).unique().all()
+    companies = db.scalars(
+        select(Company)
+        .options(
+            joinedload(Company.sources),
+            joinedload(Company.projects),
+            joinedload(Company.contacts).joinedload(CompanyPerson.person),
+            joinedload(Company.contacts).joinedload(CompanyPerson.source),
+            joinedload(Company.activities),
+        )
+        .order_by(Company.name, Company.city, Company.id)
+    ).unique().all()
+    all_relationships = db.scalars(
+        select(BusinessRelationship)
+        .options(
+            joinedload(BusinessRelationship.company),
+            joinedload(BusinessRelationship.related_company),
+            joinedload(BusinessRelationship.project),
+        )
+        .order_by(BusinessRelationship.id)
+    ).unique().all()
+    relationships_by_company: dict[int, list[BusinessRelationship]] = {}
+    for relation in all_relationships:
+        relationships_by_company.setdefault(relation.company_id, []).append(relation)
+        relationships_by_company.setdefault(relation.related_company_id, []).append(relation)
     output = io.StringIO()
     fields = [
         "name", "category", "city", "state", "website", "public_phone", "score",
-        "project_count", "source_url", "verification_status",
+        "score_reasons", "project_count", "projects", "source_url", "source_type",
+        "verification_status", "discovered_at", "source_references", "business_relationships",
+        "professional_contacts", "sales_activity", "latest_sales_outcome",
+        "next_recommended_action",
     ]
     writer = csv.DictWriter(output, fieldnames=fields)
     writer.writeheader()
     for company in companies:
-        _ = company.sources, company.projects
-        source = company.sources[0] if company.sources else None
+        sources = sorted(
+            company.sources,
+            key=lambda item: (item.discovered_at, item.id),
+            reverse=True,
+        )
+        activities = sorted(
+            company.activities,
+            key=lambda item: (item.created_at, item.id),
+            reverse=True,
+        )
+        relationships = relationships_by_company.get(company.id, [])
+        score = lead_score(company)
+        opportunity = company_opportunity_report(company, score)
+        source = sources[0] if sources else None
+        source_references = " | ".join(
+            f"{item.title or item.source_type} [{item.verification_status}] "
+            f"{item.url} (discovered {item.discovered_at.isoformat()})"
+            for item in sources
+        )
+        project_signals = " | ".join(
+            f"{project.name} [{project.status}]"
+            + (f" at {project.location}" if project.location else "")
+            for project in sorted(company.projects, key=lambda item: (item.name, item.id))
+        )
+        relationship_labels = " | ".join(
+            (
+                f"{relation.company.name} -[{relation.relationship_type}]-> "
+                f"{relation.related_company.name}"
+            )
+            + (f" ({relation.project.name})" if relation.project else "")
+            for relation in relationships
+        )
+        contact_labels = " | ".join(
+            f"{link.person.name}"
+            + (f" ({link.job_title})" if link.job_title else "")
+            + (f" <{link.person.business_email}>" if link.person.business_email else "")
+            + (f" {link.person.business_phone}" if link.person.business_phone else "")
+            + (f" [{link.source.verification_status}]" if link.source else "")
+            for link in company.contacts
+        )
+        activity_labels = " | ".join(
+            f"{item.created_at.date().isoformat()} {item.activity_type}"
+            + (f" [{item.sales_outcome}]" if item.sales_outcome else "")
+            + f": {item.notes}"
+            + (f"; next: {item.next_action}" if item.next_action else "")
+            for item in activities
+        )
         writer.writerow(
             {
                 key: safe_csv_cell(value)
@@ -1096,10 +1590,20 @@ def export_csv(
                     "state": company.state,
                     "website": company.website or "",
                     "public_phone": company.public_phone or "",
-                    "score": lead_score(company)["score"],
+                    "score": score["score"],
+                    "score_reasons": " | ".join(score["reasons"]),
                     "project_count": len(company.projects),
+                    "projects": project_signals,
                     "source_url": source.url if source else "",
+                    "source_type": source.source_type if source else "",
                     "verification_status": source.verification_status if source else "",
+                    "discovered_at": source.discovered_at.isoformat() if source else "",
+                    "source_references": source_references,
+                    "business_relationships": relationship_labels,
+                    "professional_contacts": contact_labels,
+                    "sales_activity": activity_labels,
+                    "latest_sales_outcome": opportunity["latest_sales_outcome"] or "",
+                    "next_recommended_action": opportunity["next_sales_action"]["action"],
                 }.items()
             }
         )
