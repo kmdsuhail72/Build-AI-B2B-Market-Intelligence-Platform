@@ -1,0 +1,7 @@
+aws_region      = "ap-south-1"
+name_prefix     = "n8n-b2b-bi"
+n8n_image_tag   = "SET_TO_AN_EXPLICIT_N8N_VERSION"
+timezone        = "Asia/Kolkata"
+
+# Enable these for higher availability, at additional cost.
+database_multi_az = false

@@ -1,0 +1,9 @@
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+SQLAlchemy==2.0.40
+psycopg[binary]==3.2.6
+python-multipart==0.0.20
+alembic==1.15.2
+pwdlib[argon2]==0.2.1
+langgraph==1.2.20
+mcp==1.30.0

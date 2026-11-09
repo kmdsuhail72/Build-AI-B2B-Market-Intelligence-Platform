@@ -1,0 +1,16 @@
+.venv/
+.env
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.db
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+
+# Terraform deployment state and local provider data
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfplan

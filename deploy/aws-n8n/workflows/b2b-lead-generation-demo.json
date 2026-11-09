@@ -1,0 +1,75 @@
+{
+  "name": "B2B Lead Generation Demo (Synthetic Data Only)",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "de023492-df15-4f63-80e9-26be69994e77",
+      "name": "Run synthetic demo",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        260,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const leads = [\n  {\n    name: 'Demo Northstar Studio',\n    category: 'Architect',\n    city: 'Varanasi',\n    state: 'Uttar Pradesh',\n    source_url: 'https://example.com/demo/northstar',\n    verification_status: 'unverified',\n    project_name: 'Demo Riverfront Homes',\n    estimated_units: 24,\n    doors_per_unit: 4,\n    demand_confidence: 'low',\n  },\n  {\n    name: 'Demo Banyan Buildworks',\n    category: 'Builder',\n    city: 'Lucknow',\n    state: 'Uttar Pradesh',\n    source_url: 'https://example.com/demo/banyan',\n    verification_status: 'unverified',\n    project_name: 'Demo Courtyard Residences',\n    estimated_units: 40,\n    estimated_doors: 120,\n    demand_confidence: 'low',\n  },\n  {\n    name: 'Demo Cedar Interiors',\n    category: 'Interior Designer',\n    city: 'Varanasi',\n    state: 'Uttar Pradesh',\n    source_url: 'https://example.com/demo/cedar',\n    verification_status: 'unverified',\n    demand_confidence: 'unknown',\n  },\n];\n\nreturn leads.map((lead) => ({ json: lead }));"
+      },
+      "id": "36eb76a2-46d8-470d-b1ab-aef8c184ce21",
+      "name": "Create synthetic demo leads",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        500,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const categoryPoints = {\n  architect: 30,\n  'architecture firm': 30,\n  'interior designer': 30,\n  builder: 28,\n  'real estate developer': 28,\n  contractor: 24,\n  'construction company': 24,\n  dealer: 15,\n};\n\nreturn $input.all().map(({ json: lead }) => {\n  const category = String(lead.category || '').toLowerCase();\n  const basePoints = Object.entries(categoryPoints)\n    .find(([label]) => category.includes(label))?.[1] ?? 10;\n  const verifiedPoints = lead.verification_status === 'verified' ? 20 : 0;\n  const projectPoints = lead.project_name ? 10 : 0;\n  const estimatedDoors = lead.estimated_doors ?? (\n    Number.isInteger(lead.estimated_units) && Number.isFinite(lead.doors_per_unit)\n      ? Math.round(lead.estimated_units * lead.doors_per_unit)\n      : null\n  );\n\n  return {\n    json: {\n      ...lead,\n      estimated_doors: estimatedDoors,\n      score_preview: Math.min(basePoints + verifiedPoints + projectPoints, 100),\n      review_required: true,\n      demo_notice: 'Synthetic data only. Unverified. Do not contact or sync to a CRM.',\n    },\n  };\n});"
+      },
+      "id": "b9c84cc6-0288-4ae3-93ca-3bc1ccf72f7a",
+      "name": "Normalize and score for review",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        760,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Run synthetic demo": {
+      "main": [
+        [
+          {
+            "node": "Create synthetic demo leads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create synthetic demo leads": {
+      "main": [
+        [
+          {
+            "node": "Normalize and score for review",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "f81f22c2-9dc0-4b6a-9e61-63241f2bc7ac",
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "tags": []
+}

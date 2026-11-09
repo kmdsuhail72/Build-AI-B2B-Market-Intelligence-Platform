@@ -1,0 +1,19 @@
+{
+  "servers": {
+    "vidya-timber-intelligence": {
+      "type": "stdio",
+      "command": "docker",
+      "args": [
+        "compose",
+        "run",
+        "--rm",
+        "-T",
+        "api",
+        "python",
+        "-m",
+        "app.mcp_server"
+      ],
+      "cwd": "${workspaceFolder}"
+    }
+  }
+}
